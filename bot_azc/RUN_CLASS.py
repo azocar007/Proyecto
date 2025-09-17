@@ -14,19 +14,18 @@ import traceback
 Datos = {
         # Datos para operar en el exchange
         "exchange": "BINGX",                                # Nombre del exchange a utilizar (ejemplo: "BINGX", "BINANCE", "BYBIT", "PHEMEX")
-        "symbol": "XRP",                                    # Símbolo del par a operar (ejemplo: "doge", "btc", "eth")
+        "symbol": "DOGE",                                    # Símbolo del par a operar (ejemplo: "doge", "btc", "eth")
         "positionside": "LONG",                            # Dirección inicial LONG o SHORT
         "modo_operacion": "SIMULTANEO",                       # "UNICO" - "ALTERNADO" - "SIMULTANEO" - "CARDIACO"
         "type": "LIMIT",                                    # "LIMIT" - "MARKET" - "BBO"
         "temporalidad": "1m",                               # Temporalidad de las velas a utilizar (ejemplo: "1m", "5m", "15m", "1h", "4h", "1d")
         "tiempo_espera": 0,                               # Tiempo de espera entre chequeos de ordenes pendientes (en segundos)
         "cant_velas": 200,                                  # Cantidad de velas a solicitar al exchange para el dataframe dinamico de la estrategia
-        "segundos": 10,                                     # Segundos entre chequeos de posición en monitor_open_positions()
         # Datos para la gestión STOP LOSS
         "modo_gestion": "RATIO BENEFICIO/PERDIDA",          # "REENTRADAS" - "RATIO BENEFICIO/PERDIDA" - "SNOW BALL"
         "monto_sl": 0.25,                                    # Monto en USDT para el Stop Loss
         "gestion_vol": "MARTINGALA",                        # "% DE REENTRADAS" - "MARTINGALA" - "AGRESIVO"
-        "cant_ree": 6,                                      # Cantidad de reentradas
+        "cant_ree": 10,                                      # Cantidad de reentradas
         "dist_ree": 2,                                      # Distancia en porcentaje entre reentradas (ejemplo: 2 = 2%)
         "porcentaje_vol_ree": 0,                            # Porcentaje de volumen para reentradas (ejemplo: 50% del volumen anterior)    
         "monedas": 0,                                      # Cantidad de monedas para la 1ra operación
