@@ -41,7 +41,6 @@ class BingX:
         self.ws_url = "wss://open-api-swap.bingx.com/swap-market"
         self.ws = None
         self.ws_running = False  # Controla si el WebSocket está activo
-        self.position_opened_by_strategy = False  # Flag para control de entrada
         self._detener_monitor = threading.Event()
 
         """ Variables del diccionario de entrada """
@@ -60,7 +59,6 @@ class BingX:
         self.porcentaje_vol_ree = int(self.dict["porcentaje_vol_ree"]) if "porcentaje_vol_ree" in self.dict else 0
         self.monedas = float(self.dict["monedas"])
         self.usdt = float(self.dict["usdt"])
-        self.segundos_monitoreo = int(self.dict["segundos"]) if "segundos" in self.dict else 10
         self.temporalidad = str(self.dict["temporalidad"]) if "temporalidad" in self.dict else "1m"
         self.cant_candles = int(self.dict["cant_velas"]) if "cant_velas" in self.dict else 1
 
@@ -68,20 +66,24 @@ class BingX:
         self.last_price = None
         self.avg_price = None
         self.df_vela: pd.DataFrame = None
+        
+        # Variables de parametros de entrada
+        self.enter_params = {"estrategia_valida": False}
         self.precio_sl = None
-        self.precio_entrada = None         # Solo se usa en los condicionales del metodo set_limit_market_order()
+        self.stop_ref = None
+        self.take_profit = None
+        self.precio_entrada = None
+        
+        # 📊 Estrategia, DataFrame y control de actualización
         self.estrategia = estrategia
-        # 📊 DataFrame y control de actualización
         self.df: pd.DataFrame = None      # Contendrá las velas convertidas a DataFrame dinamico
         self.last_df_update = 0           # Timestamp (epoch UTC) de la última actualización
-        self.pending_order = False
-        self.last_signal_time = 0
+        self.position_opened_by_strategy = False  # Flag para control de entrada
+        self.pending_order_by_strategy = False
+        self.orden_canceled = False
+        self.reentradas_activas = False
         self.orden_timestamp = None
         self._ultima_vela = None
-        self.df_thread = None             # Referencia al hilo de actualización de df_dynamic
-        self.long = None
-        self.short = None
-        self.enter_params = {"estrategia_valida": False}
         self.indicator = "🟢" if (self.positionside).upper() == "LONG" else "🔴"
         self.time_wait = int(self.dict["tiempo_espera"]) if self.dict["tiempo_espera"] in [0, None] else mgo.temporalidad_a_segundos(self.temporalidad)
         self.pip_price = self.pip_precio()
@@ -264,7 +266,7 @@ class BingX:
         short_position = {}
 
         if "data" not in data or not data["data"]:
-            print("DEBUG - No hay posiciones abiertas.")
+            #print("DEBUG - No hay posiciones abiertas.")
             return {"LONG": long_position, "SHORT": short_position}
 
         for position in data["data"]:
@@ -405,7 +407,10 @@ class BingX:
             if not list_tp:
                 print(f"{self.indicator} No hay Take Profit en LONG. Colocando uno...\n")
                 avg_price = float(posiciones["LONG"].get("avgPrice", 0))
-                tp_price = PosLong.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, long_amt, self.ratio)
+                if self.reentradas_activas:
+                    tp_price = avg_price + (abs(self.precio_entrada - self.precio_sl) * self.ratio)
+                else:
+                    tp_price = PosLong.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, long_amt, self.ratio)
                 self.set_take_profit(symbol, positionside, long_amt, tp_price)
 
             elif list_tp[0] != long_amt:
@@ -413,7 +418,10 @@ class BingX:
                 long_tp_id = orders["long_orders"][0]
                 self._cancel_order(symbol, long_tp_id)
                 avg_price = float(posiciones["LONG"].get("avgPrice", 0))
-                tp_price = PosLong.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, long_amt, self.ratio)
+                if self.reentradas_activas:
+                    tp_price = avg_price + (abs(self.precio_entrada - self.precio_sl) * self.ratio)
+                else:
+                    tp_price = PosLong.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, long_amt, self.ratio)
                 self.set_take_profit(symbol, positionside, long_amt, tp_price)
 
             else:
@@ -426,7 +434,10 @@ class BingX:
             if not list_tp:
                 print(f"{self.indicator} No hay Take Profit en SHORT. Colocando uno...\n")
                 avg_price = float(posiciones["SHORT"].get("avgPrice", 0))
-                tp_price = PosShort.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, short_amt, self.ratio)
+                if self.reentradas_activas:
+                    tp_price = avg_price - (abs(self.precio_entrada - self.precio_sl) * self.ratio)
+                else:
+                    tp_price = PosShort.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, short_amt, self.ratio)
                 self.set_take_profit(symbol, positionside, short_amt, tp_price)
 
             elif list_tp[0] != short_amt:
@@ -434,31 +445,31 @@ class BingX:
                 short_tp_id = orders["short_orders"][0]
                 self._cancel_order(symbol, short_tp_id)
                 avg_price = float(posiciones["SHORT"].get("avgPrice", 0))
-                tp_price = PosShort.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, short_amt, self.ratio)
+                if self.reentradas_activas:
+                    tp_price = avg_price - (abs(self.precio_entrada - self.precio_sl) * self.ratio)
+                else:
+                    tp_price = PosShort.take_profit(self.gestion_take_profit, avg_price, self.monto_sl, short_amt, self.ratio)
                 self.set_take_profit(symbol, positionside, short_amt, tp_price)
 
             else:
                 print(f"{self.indicator} Take Profit en SHORT está correcto.\n")
 
-    # Metodo para gestionar las reentradas
-    def dynamic_reentradas_manager(self, symbol: str, positionside: str, modo_gestion: str):
+    # Metodo para gestionar las reentradase
+    def dynamic_reentradas_manager(self, symbol: str, positionside: str, modo_gestion: str, monedas: float = None, cant_reentradas: int = 10):
 
         posiciones = self.get_open_position()
         long_amt = float(posiciones["LONG"].get("positionAmt", 0))
         short_amt = float(posiciones["SHORT"].get("positionAmt", 0))
-        datos_iniciales = self.monedas_de_entrada(positionside)
-        monedas_iniciales = datos_iniciales["monedas"]
-        cant_ree_real = datos_iniciales["cant_ree"]
 
         if positionside == "LONG" and long_amt > 0 and modo_gestion == "REENTRADAS":
             orders = self.get_current_open_orders("LIMIT")
             list_rl = orders["long_amt_orders"] # lista de montos de las reentradas LONG
 
-            if not list_rl and long_amt == monedas_iniciales:
+            if not list_rl and long_amt == monedas:
                 print(f"{self.indicator} Posición LONG no tiene reentradas. Colocando...\n")
                 self.set_limit_market_order(symbol, positionside, modo_gestion)
 
-            elif cant_ree_real > len(list_rl) and long_amt == monedas_iniciales:
+            elif cant_reentradas > len(list_rl) and long_amt == monedas:
                 print(f"{self.indicator} Ajustando la posición LONG a la cantidad de reentradas correctas...\n")
                 self.set_cancel_order("LIMIT")
                 self.set_limit_market_order(symbol, positionside, modo_gestion)
@@ -470,11 +481,11 @@ class BingX:
             orders = self.get_current_open_orders("STOP_MARKET")
             list_rs = orders["short_amt_orders"]
 
-            if not list_rs and short_amt == monedas_iniciales:
+            if not list_rs and short_amt == monedas:
                 print(f"{self.indicator} Posición SHORT no tiene reentradas. Colocando...\n")
                 self.set_limit_market_order(symbol, positionside, modo_gestion)
 
-            elif cant_ree_real > len(list_rs) and short_amt == monedas_iniciales:
+            elif cant_reentradas > len(list_rs) and short_amt == monedas:
                 print(f"{self.indicator} Ajustando la posición SHORT a la cantidad de reentradas correctas...\n")
                 self.set_cancel_order("LIMIT")
                 self.set_limit_market_order(symbol, positionside, modo_gestion)
@@ -483,26 +494,35 @@ class BingX:
                 print(f"{self.indicator} Posición SHORT ya tiene las reentradas correctas.\n")
 
     # Metodo para gestion de posiciones abiertas
-    def monitor_open_positions(self):
+    def monitor_open_positions(self, monto_entrada: float = None):
         symbol = self.symbol
         positionside = self.positionside
         modo_gestion = self.modo_gestion
 
+        # Llamada a los gestores individuales para TP y SL
         self.dynamic_sl_manager(symbol, positionside)
         self.dynamic_tp_manager(symbol, positionside)
+        # Llamada al gestor de reentradas
         if self.modo_gestion == "REENTRADAS" or self.modo_gestion == "SNOW BALL":
-            self.dynamic_reentradas_manager(symbol, positionside, modo_gestion)
+            datos_iniciales = self.monedas_de_entrada(positionside)
+            monedas_iniciales = datos_iniciales["monedas"]
+            cant_ree_real = datos_iniciales["cant_ree"]
+            self.dynamic_reentradas_manager(symbol, positionside, modo_gestion, monedas_iniciales, cant_ree_real)
+            #self.reentradas_activas = True
+        elif self.monedas != monto_entrada and self.orden_canceled:
+            self.dynamic_reentradas_manager(symbol, positionside, "REENTRADAS", monto_entrada, cant_ree_real)
+            self.reentradas_activas = True
+            self.orden_canceled = False
 
     # Metodo para gestionar las ordenes pendientes
-    def monitor_pending_order_2(self):
-        symbol = self.symbol
+    def monitor_pending_order(self):
         positionside = self.positionside
         typee = self.type
         max_wait = self.time_wait
         current_time = time.time()
 
         # 1️⃣ Cancelar si ya se superó el TP sin ejecutar
-        entry_price = self.long if positionside == "LONG" else self.short
+        entry_price = self.precio_entrada
         sl_price = self.precio_sl
         rr_ratio = self.ratio
         tp_distance = abs(entry_price - sl_price) * rr_ratio
@@ -515,6 +535,7 @@ class BingX:
         (positionside == "SHORT" and self.last_price <= tp_price):
             print(f"⚠️ El precio actual {self.last_price}, cruza el TP {tp_price} sin ejecutar la orden. Cancelando...")
             self.set_cancel_order(typee)
+            self.orden_canceled = True
             return
 
         # 2️⃣ Cancelar por tiempo excedido
@@ -522,6 +543,7 @@ class BingX:
         if elapsed > max_wait:
             print(f"⏳ Orden pendiente en {positionside} superó {max_wait}seg → Cancelando.")
             self.set_cancel_order(typee)
+            self.orden_canceled = True
             return
 
     # Metodo maestro para monitorear el activo y decidir acciones
@@ -529,7 +551,7 @@ class BingX:
         symbol = symbol or self.symbol
         positionside = positionside or self.positionside
         typee = self.type
-        seg = self.segundos_monitoreo
+        seg = 5
         interval = self.temporalidad
 
         MAX_REQUESTS_PER_MINUTE = 60
@@ -556,29 +578,56 @@ class BingX:
 
                 if self.orden_timestamp is not None:
                     order_time = datetime.fromtimestamp(self.orden_timestamp).strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"\n{self.indicator} MASTER - Datos de ultima señal de apertura:\n{order_time} - {self.enter_params}\n")
+                    print(f"\n{self.indicator} MASTER - Datos de ultima señal de apertura: {order_time}")
+                    pprint.pprint(self.enter_params)
+                    print(f"{self.indicator} MASTER\nPrecio de entrada: {self.precio_entrada}\nStop loss: {self.precio_sl} - Stop ref: {self.stop_ref}\nTake profit: {self.take_profit}\nMonedas: {self.monedas}\n")
 
                 positions = self.get_open_position()
-                print(f"{self.indicator} MASTER - 📊 Posiciones abiertas en {symbol}:\n🔴 SHORT: {positions["SHORT"]}\n🟢 LONG: {positions["LONG"]}")
-                print(f"{self.indicator} MASTER - Posiciones abiertas: {positions}.\nMonitoreando posición 🔍 {positionside.upper()}, cada {seg} segundos.\n")
+                print(f"{self.indicator} MASTER - 📊 Posiciones abiertas en {symbol}:\n🔴 SHORT: {positions["SHORT"]}\n🟢 LONG: {positions["LONG"]}\nMonitoreando posición 🔍 {positionside.upper()}, cada {seg} segundos.\n")
 
                 pending_orders = self.get_current_open_orders(typee)
-                #print(f"{self.indicator} MASTER - 📊 Ordenes pendientes en {symbol}:\n🔴 SHORT: {pending_orders["SHORT"]}\n🟢 LONG: {pending_orders["LONG"]}")
                 print(f"{self.indicator} MASTER - 📊 Ordenes pendientes en {symbol}:\n🔴 SHORT: {pending_orders["short_price_ordersId"]}\n🟢 LONG: {pending_orders["long_price_ordersId"]}\nMonitoreando Orden 🔍 {positionside.upper()}, cada {seg} segundos.\n")
 
-                # Control para posiciones abiertas
-                if float(positions.get(positionside, {}).get("positionAmt", 0)) > 0:
-                    # Si hay posición, llamamos al especialista en gestionar posiciones
-                    self.monitor_open_positions()
+                monto_real = float(positions.get(positionside, {}).get("positionAmt", 0))
+                ordenes_pendientes = float(pending_orders.get(positionside, 0))
 
-                # Control para ordenes pendientes
-                elif float(pending_orders.get(positionside, 0)) > 0:
+                """ Control de flujo principal basado en el estado de posiciones y órdenes """
+
+                # Control para posicion abierta y orden pendiente
+                if monto_real > 0 and ordenes_pendientes > 0 and self.reentradas_activas == False and self.orden_canceled == False:
+                    self.monitor_open_positions(monto_real)
+                    self.monitor_pending_order()
+
+                # Control para solo ordenes pendientes
+                elif ordenes_pendientes > 0 and self.reentradas_activas == False:
+                    # Si no hay posición PERO hay orden, llamamos al especialista en gestionar órdenes
+                    self.monitor_pending_order()
+
+                # Control para solo posiciones abiertas
+                elif monto_real > 0 and ordenes_pendientes == 0:
+                    # Si hay posición, llamamos al especialista en gestionar posiciones
+                    self.monitor_open_positions(monto_real)
+
+                # Control para cerrar ordenes pendientes luego de cerrarse la posicion
+                elif monto_real == 0 and ordenes_pendientes > 0 and self.reentradas_activas == True: # self.orden_canceled == False:
                     # Si no hay posición PERO hay orden, llamamos al especialista en gestionar órdenes
                     self.monitor_pending_order()
 
                 else: # Si no hay posición ni orden, iniciamos la estrategia para abrir posición
                     print(f"{self.indicator} MASTER - No hay posición abierta en {positionside}.\n⌛ Esperando señal para abrir posición...")
                     if not self.modo_operacion == "CARDIACO":
+                        # Reinicia las flags de control
+                        self.orden_canceled = False
+                        self.reentradas_activas = False
+                        self.position_opened_by_strategy = False
+                        self.pending_order_by_strategy = False
+                        # Reinicia la señal de entrada y variables de entrada
+                        self.enter_params = {"estrategia_valida": False}
+                        self.precio_sl = None
+                        self.stop_ref = None
+                        self.monedas = None
+                        self.take_profit = None
+                        self.precio_entrada = None
                         self.check_strategy_loop()
                     else:
                         print("🧘 Modo CARDIACO: no se abrirán nuevas posiciones automáticamente.")
@@ -587,7 +636,7 @@ class BingX:
 
             except Exception as e:
                 print(f"{self.indicator} ❌ MASTER - Error obteniendo posiciones: {e}\n")
-                traceback.print_exc()
+                #traceback.print_exc()
 
             time.sleep(seg)
 
@@ -740,6 +789,15 @@ class BingX:
 
         def on_message(ws, message):
             try:
+                # Si ya hay posición o orden abierta por la estrategia, se sale del bucle Websocket
+                if self.position_opened_by_strategy or self.pending_order_by_strategy or not self.estrategia_instancia.activar_websocket():
+                    if not self.estrategia_instancia.activar_websocket():
+                        print(f"{self.indicator} CHECK STRATEGY - ❌ WebSocket desactivado por la estrategia. Saliendo de WebSocket")
+                    else:
+                        print(f"{self.indicator} CHECK STRATEGY - ❌ Posición u orden abierta por la estrategia. Saliendo de WebSocket")
+                    ws.close()
+                    return
+
                 compressed_data = gzip.GzipFile(fileobj=io.BytesIO(message), mode='rb')
                 decompressed_data = compressed_data.read().decode('utf-8')
                 data = json.loads(decompressed_data)
@@ -751,7 +809,7 @@ class BingX:
                     required_keys = {"o", "h", "l", "c", "v", "T"}  
                     if not required_keys.issubset(vela.keys()):  
                         print(f"{self.indicator} WEBSOCKET - ⚠️ Datos de vela inválidos, descartando paquete: {vela}")  
-                        return  # 🔴 No procesamos data mala
+                        return  # No procesamos data mala
                     # ✅ Procesar solo si la data es válida
                     self.last_price = float(vela["c"])  
                     avg_price = (float(vela["c"]) + float(vela["o"]) + float(vela["h"]) + float(vela["l"])) / 4  
@@ -767,24 +825,18 @@ class BingX:
 
                     # Se evalua la entrada con websocket
                     df_temp = pd.concat([self.df_dynamic, self.df_vela])
-                    resultado = self.estrategia_instancia.evaluar_entrada(df_temp)
+                    resultado = self.estrategia_instancia.evaluar_entrada(df_temp, self.last_price, self.avg_price)
                     if resultado.get("estrategia_valida", False):
-                        self.estrategia_instancia.reiniciar_condiciones()
                         self.enter_params = resultado
-                        self.precio_sl = resultado.get("stop_loss", None)
-                        self.monedas = resultado.get("cant_mon", None)
-                        if self.positionside == "LONG":
-                            self.long = resultado.get("precio_entrada", None)
-                        else: # self.positionside == "SHORT"
-                            self.short = resultado.get("precio_entrada", None)
+                        self.estrategia_instancia.reiniciar_condiciones()
                         print("✅ señal de apertura detectada. Cambiando a monitoreo.")
                         ws.close()  # Cerrar WebSocket para volver al monitoreo de la posición
                         return
-                    else: # No hay señal, se reinician las condiciones
+                    elif resultado.get("estrategia_valida", False) == "reiniciar": # No hay señal, se reinician las condiciones
                         self.estrategia_instancia.reiniciar_condiciones()
+                        print(f"{self.indicator}🔄{self.indicator} Reiniciando condiciones de la estrategia.")
                         ws.close()  # Cerrar WebSocket para volver a la evaluación de la estrategia
                         return
-
 
             except Exception as e:
                 print(f"{self.indicator} WEBSOCKET -❌ Error procesando mensaje: {e}")
@@ -826,20 +878,25 @@ class BingX:
                 seconds = mgo.temporalidad_a_segundos(self.temporalidad)
                 now = time.time()
 
+                # Si ya hay posición u orden abierta por la estrategia, se sale del bucle
+                if self.position_opened_by_strategy or self.pending_order_by_strategy:
+                    print(f"{self.indicator} CHECK STRATEGY - Posición u orden abierta por la estrategia. Cambiando a MASTER MONITOR.")
+                    return
+
                 # Si la estrategia envio señal de entrada
-                if self.enter_params.get("estrategia_valida", False):
+                elif self.enter_params.get("estrategia_valida", False):
+                    # Se asigna valores a variables de parametros de entrada
+                    self.precio_sl = self.enter_params.get("stop_loss", None)
+                    self.stop_ref = self.enter_params.get("stop_ref", None)
+                    self.monedas = self.enter_params.get("cant_mon", None)
+                    self.take_profit = self.enter_params.get("take_profit", None)
+                    self.precio_entrada = self.enter_params.get("precio_entrada", None)
 
                     # Llamada a la función para colocar la orden de mercado o limit
                     self.set_limit_market_order(self.symbol, self.positionside, self.modo_gestion, self.enter_params)
-                    self.api_secretorden_timestamp = time.time()
-                    #orden_timestamp = pd.to_datetime(orden_timestamp, unit='ms')
-                    #self.orden_timestamp = calendar.timegm(orden_timestamp.utctimetuple())
-                    if self.positionside == "LONG":
-                        self.precio_entrada = self.long
-                    else: # self.positionside == "SHORT"
-                        self.precio_entrada = self.short
+                    self.orden_timestamp = time.time()
                     print(f"{self.indicator} CHECK STRATEGY -📉 Señal activada, ejecutando entrada en {self.positionside} 🔥💰\nPrecio de entrada {self.precio_entrada}, Precio de Stop loss {self.precio_sl}\n")
-                    time.sleep(3)
+                    time.sleep(5)
 
                     # Verifica si la posición se abrió correctamente
                     positions = self.get_open_position()
@@ -847,95 +904,82 @@ class BingX:
                         long_amt = float(positions["LONG"].get("positionAmt", 0))
                         if long_amt > 0:
                             self.position_opened_by_strategy = True
-                            self.enter_params = {"estrategia_valida": False} # Reinicia la señal de entrada
-                            self.precio_sl = None
-                            self.long = None
-                            self.short = None
-                            print(f"{self.indicator} CHECK STRATEGY -✅ Posición abierta en {self.positionside}. MASTER MONITOR.")
+                            print(f"{self.indicator} CHECK STRATEGY - Posición abierta en {self.positionside}. MASTER MONITOR.")
                             return
                     elif self.positionside == "SHORT":
                         short_amt = float(positions["SHORT"].get("positionAmt", 0))
                         if short_amt > 0:
                             self.position_opened_by_strategy = True
-                            self.enter_params = {"estrategia_valida": False} # Reinicia la señal de entrada
-                            self.precio_sl = None
-                            self.long = None
-                            self.short = None
-                            print(f"{self.indicator} CHECK STRATEGY -✅ Posición abierta en {self.positionside}. MASTER MONITOR.")
+                            print(f"{self.indicator} CHECK STRATEGY - Posición abierta en {self.positionside}. MASTER MONITOR.")
                             return
 
                     # Verifica si existen ordenes abiertas
                     open_order = self.get_current_open_orders("LIMIT")
                     if (self.positionside == "LONG" and open_order["LONG"] > 0) or (self.positionside == "SHORT" and open_order["SHORT"] > 0):
-                        self.pending_order = True
-                        self.enter_params = {"estrategia_valida": False} # Reinicia la señal de entrada
-                        self.precio_sl = None
-                        self.long = None
-                        self.short = None
-                        print(f"{self.indicator} CHECK STRATEGY -✅ Orden pendiente en {self.positionside}. Cambiando a MASTER MONITOR.")
+                        self.pending_order_by_strategy = True
+                        print(f"{self.indicator} CHECK STRATEGY - Orden pendiente en {self.positionside}. Cambiando a MASTER MONITOR.")
                         return
 
-                if self.df is None or (now - self.last_df_update > seconds):
-                    try: #  Verifica que no haya errores en el Dataframe
-                        nuevo_df = mgo.conv_pdataframe(self.get_last_candles(self.symbol, self.temporalidad, self.cant_candles))
-                        if nuevo_df is None or nuevo_df.empty:
-                            raise ValueError("DataFrame vacío o None recibido.")
-                        self.df = nuevo_df
-                        # Detectar si el tiempo está en índice o en columna
-                        if "Time" in self.df.columns:
-                            t = pd.to_datetime(self.df["Time"].iloc[-1], unit="ms")
+                else: # Actualización del DataFrame dinámico por cada vela cerrada
+                    if self.df is None or (now - self.last_df_update > seconds):
+                        try: #  Verifica que no haya errores en el Dataframe
+                            nuevo_df = mgo.conv_pdataframe(self.get_last_candles(self.symbol, self.temporalidad, self.cant_candles))
+                            if nuevo_df is None or nuevo_df.empty:
+                                raise ValueError("DataFrame vacío o None recibido.")
+                            self.df = nuevo_df
+                            # Detectar si el tiempo está en índice o en columna
+                            if "Time" in self.df.columns:
+                                t = pd.to_datetime(self.df["Time"].iloc[-1], unit="ms")
+                            else:
+                                t = self.df.index[-1].to_pydatetime()                        
+                            self.last_df_update = calendar.timegm(t.utctimetuple())
+                        except Exception as e:
+                            print(f"{self.indicator} CHECK STRATEGY - ❌ Error actualizando DataFrame: {e}")
+                            #traceback.print_exc()
+                            time.sleep(3)
+                            continue  # Reintenta rápido sin esperar nueva vela
+
+                        self.df_dynamic = self.df.iloc[:-1]
+                        if "Time" in self.df_dynamic.columns:
+                            df_ahora = self.df_dynamic["Time"].iloc[-1]
                         else:
-                            t = self.df.index[-1].to_pydatetime()                        
-                        self.last_df_update = calendar.timegm(t.utctimetuple())
-                    except Exception as e:
-                        print(f"{self.indicator} CHECK STRATEGY - ❌ Error actualizando DataFrame: {e}")
-                        traceback.print_exc()
-                        time.sleep(3)
-                        continue  # Reintenta rápido sin esperar nueva vela
+                            df_ahora = self.df_dynamic.index[-1]
 
-                    self.df_dynamic = self.df.iloc[:-1]
-                    if "Time" in self.df_dynamic.columns:
-                        df_ahora = self.df_dynamic["Time"].iloc[-1]
-                    else:
-                        df_ahora = self.df_dynamic.index[-1]
+                        if self._ultima_vela != df_ahora:
+                            print(f"{self.indicator} CHECK STRATEGY - 🔍 Nueva vela detectada {self.symbol} {self.temporalidad}")
+                            self._ultima_vela = df_ahora
 
-                    if self._ultima_vela != df_ahora:
-                        print(f"{self.indicator} CHECK STRATEGY - 🔍 Nueva vela detectada")
-                        self._ultima_vela = df_ahora
+                            """ Se instancia la estrategia """
+                            self.estrategia_instancia = self.estrategia(
+                                                                        self.df_dynamic,
+                                                                        self.decimales_price,
+                                                                        self.pip_price,
+                                                                        self.pip_mon,
+                                                                        self.indicator,
+                                                                        self.positionside,
+                                                                        self.monto_sl,
+                                                                        self.ratio
+                                                                        )
 
-                        # Se instancia la estrategia
-                        self.estrategia_instancia = self.estrategia(
-                                                                    self.df_dynamic,
-                                                                    self.last_price,
-                                                                    self.avg_price,
-                                                                    self.decimales_price,
-                                                                    self.indicator,
-                                                                    self.positionside,
-                                                                    self.monto_sl
-                                                                    )
+                            # Calculo de imdicadores tecnicos
+                            self.estrategia_instancia._calcular_indicadores()
+                            # Evaluación de condiciones sin websocket
+                            self.estrategia_instancia.condiciones_sin_websocket()
+                            # Si requiere websocket, se inicia la conexión
+                            if self.estrategia_instancia.requiere_websocket():
+                                if self.estrategia_instancia.activar_websocket():
+                                #if True: # Se activa websocket para ensayos
+                                    self.estrategia_instancia.incrementar_ventana()
+                                    threading.Thread(target=self.start_websocket).start()  # Hilo explícito
+                                    #self.start_websocket()
+                                    print(f"{self.indicator} CHECK STRATEGY - Activando WebSocket para {self.symbol} con temporalidad {self.temporalidad} dirección {self.positionside} ...")
 
-                        self.estrategia_instancia._calcular_indicadores()
-                        self.estrategia_instancia.condiciones_sin_websocket()
-                        #self.start_websocket() # Inicia el WebSocket para ensayos
-                        # Si requiere websocket, se inicia la conexión
-                        if self.estrategia_instancia.requiere_websocket():
-                            if self.estrategia_instancia.activar_websocket():
-                                self.estrategia_instancia.incrementar_ventana()
-                                self.start_websocket()
-                                print(f"{self.indicator} CHECK STRATEGY - Activando WebSocket para {self.symbol} con temporalidad {self.temporalidad} dirección {self.positionside} ...")
-
-                        else: # Si no requiere websocket, se evalua la entrada solo con indicadores
-                            resultado = self.estrategia_instancia.evaluar_entrada()
-                            if resultado.get("estrategia_valida", False):
-                                self.estrategia_instancia.reiniciar_condiciones()
-                                self.enter_params = resultado
-                                self.precio_sl = resultado.get("stop_loss", None)
-                                self.monedas = resultado.get("cant_mon", None)
-                                if self.positionside == "LONG":
-                                    self.long = resultado.get("precio_entrada", None)
-                                else: # self.positionside == "SHORT"
-                                    self.short = resultado.get("precio_entrada", None)
-                                print("✅ señal de apertura detectada. Cambiando a monitoreo.")
+                            else: # Si no requiere websocket, se evalua la entrada solo con indicadores
+                                resultado = self.estrategia_instancia.evaluar_entrada()
+                                if resultado.get("estrategia_valida", False):
+                                    self.enter_params = resultado
+                                    self.estrategia_instancia.reiniciar_condiciones()
+                                    print("🎯 señal de apertura detectada. Cambiando a monitoreo.")
 
             except Exception as e:
                 print(f"{self.indicator} CHECK STRATEGY - ❌ Error: {e}\n")
